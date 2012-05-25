@@ -23,8 +23,13 @@ my.SlickGrid = Backbone.View.extend({
     this.model.currentDocuments.bind('reset', this.render);
     this.model.currentDocuments.bind('remove', this.render);
 
-    //TODO
-    var state = _.extend({ }, modelEtc.state
+    var state = _.extend({
+        hiddenColumns: [],
+        columnsOrder: [],
+        columnsSort: {},
+        columnsWidth: [],
+        fitColumns: false
+      }, modelEtc.state
     );
     this.state = new recline.Model.ObjectState(state);
 
@@ -32,6 +37,9 @@ my.SlickGrid = Backbone.View.extend({
       // If the div is hidden, SlickGrid will calculate wrongly some
       // sizes so we must render it explicitly when the view is visible
       if (!self.rendered){
+        if (!self.grid){
+          self.render();
+        }
         self.grid.init();
         self.rendered = true;
       }
@@ -55,39 +63,106 @@ my.SlickGrid = Backbone.View.extend({
       enableColumnReorder: true,
       explicitInitialization: true,
       syncColumnCellResize: true,
+      forceFitColumns: this.state.get('fitColumns')
     };
 
+    // We need all columns, even the hidden ones, to show on the column picker
     var columns = [];
     _.each(this.model.fields.toJSON(),function(field){
-      columns.push({id:field['id'],
+      var column = {id:field['id'],
                     name:field['label'],
                     field:field['id'],
                     sortable: true,
-                    minWidth: 80});
+                    minWidth: 80};
+
+      var widthInfo = _.find(self.state.get('columnsWidth'),function(c){return c.column == field.id});
+      if (widthInfo){
+        column['width'] = widthInfo.width;
+      }
+
+      columns.push(column);
     });
+
+    // Restrict the visible columns
+    var visibleColumns = columns.filter(function(column) {
+      return _.indexOf(self.state.get('hiddenColumns'), column.id) == -1;
+    });
+
+    // Order them if there is ordering info on the state
+    if (this.state.get('columnsOrder')){
+      visibleColumns = visibleColumns.sort(function(a,b){
+        return _.indexOf(self.state.get('columnsOrder'),a.id) > _.indexOf(self.state.get('columnsOrder'),b.id);
+      });
+      columns = columns.sort(function(a,b){
+        return _.indexOf(self.state.get('columnsOrder'),a.id) > _.indexOf(self.state.get('columnsOrder'),b.id);
+      });
+    }
+
+    // Move hidden columns to the end, so they appear at the bottom of the
+    // column picker
+    var tempHiddenColumns = [];
+    for (var i = columns.length -1; i >= 0; i--){
+      if (_.indexOf(_.pluck(visibleColumns,'id'),columns[i].id) == -1){
+        tempHiddenColumns.push(columns.splice(i,1)[0]);
+      }
+    }
+    columns = columns.concat(tempHiddenColumns);
+
 
     var data = this.model.currentDocuments.toJSON();
 
-    this.grid = new Slick.Grid(this.el, data, columns, options);
+    this.grid = new Slick.Grid(this.el, data, visibleColumns, options);
+
+    // Column sorting
+    var gridSorter = function(field, ascending, grid, data){
+
+      data.sort(function(a, b){
+          var result =
+              a[field] > b[field] ? 1 :
+              a[field] < b[field] ? -1 :
+              0
+          ;
+          return ascending ? result : -result;
+      });
+
+      grid.setData(data);
+      grid.updateRowCount();
+      grid.render();
+    }
+
+    var sortInfo = this.state.get('columnsSort');
+    if (sortInfo){
+      var sortAsc = !(sortInfo['direction'] == 'desc');
+      gridSorter(sortInfo.column, sortAsc, self.grid, data);
+      this.grid.setSortColumn(sortInfo.column, sortAsc);
+    }
+
     this.grid.onSort.subscribe(function(e, args){
-
-        var field = args.sortCol.field;
-
-        data.sort(function(a, b){
-            var result =
-                a[field] > b[field] ? 1 :
-                a[field] < b[field] ? -1 :
-                0
-            ;
-            return args.sortAsc ? result : -result;
-        });
-
-        self.grid.setData(data);
-        self.grid.updateRowCount();
-        self.grid.render();
+      gridSorter(args.sortCol.field,args.sortAsc,self.grid,data);
+      self.state.set({columnsSort:{
+                      column:args.sortCol,
+                      direction: (args.sortAsc) ? 'asc':'desc'
+                   }});
     });
 
-    var columnpicker = new Slick.Controls.ColumnPicker(columns, this.grid, options);
+    this.grid.onColumnsReordered.subscribe(function(e, args){
+      self.state.set({columnsOrder: _.pluck(self.grid.getColumns(),'id')});
+    });
+
+    this.grid.onColumnsResized.subscribe(function(e, args){
+        var columns = args.grid.getColumns();
+        var defaultColumnWidth = args.grid.getOptions().defaultColumnWidth;
+        var columnsWidth = [];
+        _.each(columns,function(column){
+          if (column.width != defaultColumnWidth){
+            columnsWidth.push({column:column.id,width:column.width});
+          }
+        });
+        self.state.set({columnsWidth:columnsWidth});
+    });
+
+    var columnpicker = new Slick.Controls.ColumnPicker(columns, this.grid,
+                                                       _.extend(options,{state:this.state}));
 
     if (self.visible){
       self.grid.init();
@@ -151,7 +226,7 @@ my.SlickGrid = Backbone.View.extend({
             .appendTo($li);
       }
       $('<li/>').addClass('divider').appendTo($menu);
-      $li = $('<li />').appendTo($menu);
+      $li = $('<li />').data('option', 'autoresize').appendTo($menu);
       $input = $('<input type="checkbox" />').data('option', 'autoresize').attr('id','slick-option-autoresize');
       $input.appendTo($li);
       $('<label />')
@@ -169,12 +244,22 @@ my.SlickGrid = Backbone.View.extend({
 
     function updateColumn(e) {
       if ($(e.target).data('option') == 'autoresize') {
-        if (e.target.checked) {
+        var checked;
+        if ($(e.target).is('li')){
+            var checkbox = $(e.target).find('input').first();
+            checked = !checkbox.is(':checked');
+            checkbox.attr('checked',checked);
+        } else {
+          checked = e.target.checked;
+        }
+
+        if (checked) {
           grid.setOptions({forceFitColumns:true});
           grid.autosizeColumns();
         } else {
           grid.setOptions({forceFitColumns:false});
         }
+        options.state.set({fitColumns:checked});
         return;
       }
 
@@ -185,11 +270,15 @@ my.SlickGrid = Backbone.View.extend({
             checkbox.attr('checked',!checkbox.is(':checked'));
         }
         var visibleColumns = [];
+        var hiddenColumnsIds = [];
         $.each(columnCheckboxes, function (i, e) {
           if ($(this).is(':checked')) {
             visibleColumns.push(columns[i]);
+          } else {
+            hiddenColumnsIds.push(columns[i].id);
           }
         });
+
 
         if (!visibleColumns.length) {
           $(e.target).attr('checked', 'checked');
@@ -197,6 +286,7 @@ my.SlickGrid = Backbone.View.extend({
         }
 
         grid.setColumns(visibleColumns);
+        options.state.set({hiddenColumns:hiddenColumnsIds});
       }
     }
     init();
